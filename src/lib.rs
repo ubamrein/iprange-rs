@@ -348,6 +348,8 @@ where
 
     /// Returns a copy of the network with the address truncated to the given length.
     fn with_new_prefix(&self, len: u8) -> Self;
+    /// Returns the ip version
+    fn ip_version(&self) -> IpVersion;
 }
 
 /// Anything that can be converted to `IpNet`.
@@ -381,7 +383,7 @@ pub trait TraverseState {
 
     fn node(&self) -> *const IpTrieNode;
 
-    fn init(root: &IpTrieNode) -> Self;
+    fn init(root: &IpTrieNode, v4: IpVersion) -> Self;
 
     fn transit(&self, next_node: &IpTrieNode, current_bit: bool) -> Self;
 
@@ -461,7 +463,7 @@ where
             }
             root
         } else {
-            self.root = Some(IpTrieNode::new());
+            self.root = Some(IpTrieNode::new(network.ip_version()));
             self.root.as_mut().unwrap()
         };
 
@@ -479,7 +481,7 @@ where
                     node = child;
                 }
                 None => {
-                    *child = Some(Box::new(IpTrieNode::new()));
+                    *child = Some(Box::new(IpTrieNode::new(network.ip_version())));
                     node = child.as_mut().unwrap();
                 }
             }
@@ -552,18 +554,26 @@ where
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct IpTrieNode {
     children: [Option<Box<IpTrieNode>>; 2],
+    version: IpVersion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpVersion {
+    V4,
+    V6,
 }
 
 impl IpTrieNode {
-    fn new() -> IpTrieNode {
+    fn new(version: IpVersion) -> IpTrieNode {
         IpTrieNode {
             children: [None, None],
+            version,
         }
     }
 
     #[inline]
     fn init_traverse_state<S: TraverseState>(&self) -> S {
-        S::init(self)
+        S::init(self, self.version)
     }
 
     // If both the zero child and the one child of a node are None,
@@ -624,8 +634,8 @@ impl IpTrieNode {
         // to remove, we must split it into two deeper nodes.
         if self.is_leaf() {
             self.children = [
-                Some(Box::new(IpTrieNode::new())),
-                Some(Box::new(IpTrieNode::new())),
+                Some(Box::new(IpTrieNode::new(self.version))),
+                Some(Box::new(IpTrieNode::new(self.version))),
             ];
         }
 
@@ -658,6 +668,39 @@ impl IpTrieNode {
 
 const MSO_U128: u128 = 1 << 127; // Most significant one for u128
 const MSO_U32: u32 = 1 << 31; // Most significant one for u32
+impl IpNet for ipnet::IpNet {
+    type S = IpTraverseState;
+
+    type I = IpPrefixBitIterator;
+
+    fn prefix_bits(&self) -> Self::I {
+        match self {
+            ipnet::IpNet::V4(v4) => IpPrefixBitIterator::Ipv4PrefixBitIterator(v4.prefix_bits()),
+            ipnet::IpNet::V6(v6) => IpPrefixBitIterator::Ipv6PrefixBitIterator(v6.prefix_bits()),
+        }
+    }
+
+    fn prefix_len(&self) -> u8 {
+        match self {
+            ipnet::IpNet::V4(v4) => v4.prefix_len(),
+            ipnet::IpNet::V6(v6) => v6.prefix_len(),
+        }
+    }
+
+    fn with_new_prefix(&self, len: u8) -> Self {
+        match self {
+            ipnet::IpNet::V4(v4) => v4.with_new_prefix(len).into(),
+            ipnet::IpNet::V6(v6) => v6.with_new_prefix(len).into(),
+        }
+    }
+    #[inline]
+    fn ip_version(&self) -> IpVersion {
+        match self {
+            ipnet::IpNet::V4(_) => IpVersion::V4,
+            ipnet::IpNet::V6(_) => IpVersion::V6,
+        }
+    }
+}
 
 impl IpNet for Ipv4Net {
     type S = Ipv4TraverseState;
@@ -680,6 +723,19 @@ impl IpNet for Ipv4Net {
     #[inline]
     fn with_new_prefix(&self, len: u8) -> Self {
         Ipv4Net::new(self.addr(), len).unwrap().trunc()
+    }
+    #[inline]
+    fn ip_version(&self) -> IpVersion {
+        IpVersion::V4
+    }
+}
+
+impl ToNetwork<ipnet::IpNet> for ipnet::IpNet {
+    fn to_network(&self) -> ipnet::IpNet {
+        match self {
+            ipnet::IpNet::V4(v4) => ipnet::IpNet::from(v4.to_network()),
+            ipnet::IpNet::V6(v6) => ipnet::IpNet::from(v6.to_network()),
+        }
     }
 }
 
@@ -711,6 +767,54 @@ impl ToNetwork<Ipv4Net> for [u8; 4] {
     }
 }
 
+pub enum IpTraverseState {
+    Ipv4TraverseState(Ipv4TraverseState),
+    Ipv6TraverseState(Ipv6TraverseState),
+}
+
+impl TraverseState for IpTraverseState {
+    type Net = ipnet::IpNet;
+
+    fn node(&self) -> *const IpTrieNode {
+        match self {
+            IpTraverseState::Ipv4TraverseState(v4) => v4.node(),
+            IpTraverseState::Ipv6TraverseState(v6) => v6.node(),
+        }
+    }
+
+    fn init(root: &IpTrieNode, version: IpVersion) -> Self {
+        match version {
+            IpVersion::V4 => IpTraverseState::Ipv4TraverseState(Ipv4TraverseState {
+                node: root,
+                prefix: 0,
+                prefix_len: 0,
+            }),
+            IpVersion::V6 => IpTraverseState::Ipv6TraverseState(Ipv6TraverseState {
+                node: root,
+                prefix: 0,
+                prefix_len: 0,
+            }),
+        }
+    }
+
+    fn transit(&self, next_node: &IpTrieNode, current_bit: bool) -> Self {
+        match self {
+            IpTraverseState::Ipv4TraverseState(v4) => {
+                IpTraverseState::Ipv4TraverseState(v4.transit(next_node, current_bit))
+            }
+            IpTraverseState::Ipv6TraverseState(v6) => {
+                IpTraverseState::Ipv6TraverseState(v6.transit(next_node, current_bit))
+            }
+        }
+    }
+
+    fn build(&self) -> Self::Net {
+        match self {
+            IpTraverseState::Ipv4TraverseState(v4) => v4.build().into(),
+            IpTraverseState::Ipv6TraverseState(v6) => v6.build().into(),
+        }
+    }
+}
 #[doc(hidden)]
 pub struct Ipv4TraverseState {
     node: *const IpTrieNode,
@@ -727,7 +831,7 @@ impl TraverseState for Ipv4TraverseState {
     }
 
     #[inline]
-    fn init(root: &IpTrieNode) -> Self {
+    fn init(root: &IpTrieNode, _: IpVersion) -> Self {
         Ipv4TraverseState {
             node: root,
             prefix: 0,
@@ -752,6 +856,21 @@ impl TraverseState for Ipv4TraverseState {
     #[inline]
     fn build(&self) -> Self::Net {
         Ipv4Net::new(self.prefix.into(), self.prefix_len as u8).unwrap()
+    }
+}
+
+pub enum IpPrefixBitIterator {
+    Ipv4PrefixBitIterator(Ipv4PrefixBitIterator),
+    Ipv6PrefixBitIterator(Ipv6PrefixBitIterator),
+}
+impl Iterator for IpPrefixBitIterator {
+    type Item = bool;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            IpPrefixBitIterator::Ipv4PrefixBitIterator(v4) => v4.next(),
+            IpPrefixBitIterator::Ipv6PrefixBitIterator(v6) => v6.next(),
+        }
     }
 }
 
@@ -797,6 +916,10 @@ impl IpNet for Ipv6Net {
     #[inline]
     fn with_new_prefix(&self, len: u8) -> Self {
         Ipv6Net::new(self.addr(), len).unwrap().trunc()
+    }
+    #[inline]
+    fn ip_version(&self) -> IpVersion {
+        IpVersion::V6
     }
 }
 
@@ -851,7 +974,7 @@ impl TraverseState for Ipv6TraverseState {
     }
 
     #[inline]
-    fn init(root: &IpTrieNode) -> Self {
+    fn init(root: &IpTrieNode, _: IpVersion) -> Self {
         Ipv6TraverseState {
             node: root,
             prefix: 0,
